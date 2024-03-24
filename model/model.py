@@ -18,13 +18,18 @@ class MTCGModel(nn.Module):
         # 超参数
         self.args = args
         self.head_num = None
-        self.loss_list = None
+        self.losslist = None
         self.latent_classify_head = None
         self.aspect_gap_head = None
+        if 'variation' in args:
+            self.variation = args.variation
+        else:
+            self.variation = 0
 
         # 编码器
         self.encoder = encoder
         self.encoder_config = encoder.config
+        self.encoder_hidden_size = self.encoder_config.hidden_size
 
         # 潜在空间参数
         self.latent_size = args.latent_size
@@ -46,7 +51,7 @@ class MTCGModel(nn.Module):
             torch.nn.Tanh(),
             nn.Dropout(self.decoder_config.attn_pdrop)
         )
-        # 将潜在空间的表示转换成GPT-2模型进行解码时所需的表示
+        # 将潜在空间的表示转换成GPT-2模型进行解码时所需的表示，即前缀Prefix
         self.connector_decoder = nn.Sequential(
             torch.nn.Linear(self.latent_num * self.latent_size,
                             self.seq_len * self.decoder_num_layer * 2 * self.decoder_hidden_size),
@@ -103,7 +108,14 @@ class MTCGModel(nn.Module):
 
     def attribute_classify_loss(self, latent, pos_label, neg_labels, head_index=None):
         """
-        属性分类损失:用于区分同一方面的各种不同的属性
+        属性分类损失:使用属性分类器用于区分同一方面的各种不同的属性
+
+        输入参数:
+           - latent: 输入的潜在表示，可以是二维或三维张量。
+           - pos_label: 正样本的标签。
+           - neg_labels: 负样本的标签集合。
+           - head_index: 当使用多头分类器时，指定要使用的头的索引。
+
         """
         if len(latent.shape) == 3:
             latent = latent.view(-1, self.latent_num * self.latent_size)
@@ -132,6 +144,15 @@ class MTCGModel(nn.Module):
             raise Exception('Wrong latent classifier head type.')
 
     def set_attribute_classify_head(self, head_num=1, class_num_per_head=2, mid_size=128, head_type='single'):
+        """
+        创建属性分类器
+
+        输入参数:
+           - head_num: 分类头的数量。
+           - class_num_per_head: 每个头的类别数，可以是单个数值或列表（对于多头情况下的每个头）。
+           - mid_size: 分类器中间层的大小。
+           - head_type: 分类头的类型（`single` 或 `multiple`）。
+        """
         if head_type == 'single':
             self.latent_classify_head = nn.Sequential(
                 nn.Linear(self.latent_num * self.latent_size, mid_size),
@@ -144,8 +165,8 @@ class MTCGModel(nn.Module):
                     nn.Sequential(
                         nn.Linear(self.latent_num * self.latent_size, mid_size),
                         nn.ReLU(),
-                        nn.Linear(mid_size, head_num)
-                    ) for head_num in class_num_per_head]
+                        nn.Linear(mid_size, num)
+                    ) for num in class_num_per_head]
                 )
             else:
                 self.latent_classify_head = nn.ModuleList([
@@ -159,6 +180,10 @@ class MTCGModel(nn.Module):
     def aspect_gap_loss(self, latent, head_index):
         """
         方面分类损失:用于区分不同方面
+
+        输入参数
+            - `latent`: 输入的潜在表示，可以是二维或三维张量。这表示经过模型的中间层后的数据表示，用于捕捉数据的抽象特征。
+            - `head_index`: 指定当前处理的方面头的索引。这是用于区分模型中不同方面或任务的索引值。
         """
         if len(latent.shape) == 3:
             latent = latent.view(-1, self.latent_num * self.latent_size)
@@ -177,6 +202,11 @@ class MTCGModel(nn.Module):
         return loss
 
     def set_aspect_gap_head(self, latent, head_index):
+        """
+        输入参数
+            - `latent`: 输入的潜在表示，可以是一维或二维张量，表示经过模型处理后的数据特征表示。
+            - `head_index`: 指定要更新的方面头的索引。
+        """
         if len(latent.shape) == 3:
             latent = latent.view(-1, self.latent_num * self.latent_size)
 
@@ -190,9 +220,10 @@ class MTCGModel(nn.Module):
                 assert self.aspect_gap_head[head_index].shape == latent.shape
             self.aspect_gap_head[head_index] = latent.detach()
 
+
     def set_losslist(self,
                      losslist: dict,
-                     latent_classify_args={'head_num': 1, 'class_num_per_head': 2, 'mid_size': 128,
+                     attribute_classify_args={'head_num': 1, 'class_num_per_head': 2, 'mid_size': 128,
                                            'head_type': 'single'},
                      aspect_gap_args={'head_num': 2, 'amplification': 5}
                      ):
@@ -200,21 +231,22 @@ class MTCGModel(nn.Module):
         用于在自动编码器模型中配置不同类型的损失函数和它们的参数。
         例如：{'contrasitive_loss': 0.001, 'sparse_loss': 0.001, 'attribute_classify_loss':0.1, 'aspect_gap_loss':0.1}
         """
-        self.loss_list = losslist
+        self.losslist = losslist
         if 'attribute_classify_loss' in losslist:
+            print("attribute_classify_loss in losslist")
             self.head_num = 1
             class_num_per_head = 2
             mid_size = 128
             head_type = 'single'
-            if latent_classify_args is not None:
-                if 'head_num' in latent_classify_args:
-                    self.head_num = latent_classify_args['head_num']
-                if 'class_num_per_head' in latent_classify_args:
-                    class_num_per_head = latent_classify_args['class_num_per_head']
-                if 'mid_size' in latent_classify_args:
-                    mid_size = latent_classify_args['mid_size']
-                if 'head_type' in latent_classify_args:
-                    head_type = latent_classify_args['head_type']
+            if attribute_classify_args is not None:
+                if 'head_num' in attribute_classify_args:
+                    self.head_num = attribute_classify_args['head_num']
+                if 'class_num_per_head' in attribute_classify_args:
+                    class_num_per_head = attribute_classify_args['class_num_per_head']
+                if 'mid_size' in attribute_classify_args:
+                    mid_size = attribute_classify_args['mid_size']
+                if 'head_type' in attribute_classify_args:
+                    head_type = attribute_classify_args['head_type']
 
             self.set_attribute_classify_head(head_num=self.head_num, class_num_per_head=class_num_per_head,
                                              mid_size=mid_size, head_type=head_type)
@@ -222,14 +254,13 @@ class MTCGModel(nn.Module):
             self.latent_classify_head_type = head_type
 
         if 'aspect_gap_loss' in losslist:
+            print("aspect_gap_loss in losslist")
             if 'attribute_classify_loss' in losslist:
                 if self.latent_classify_head_type == 'multiple':
                     self.aspect_head_num = self.head_num
                 elif self.latent_classify_head == 'single':
-                    print('set aspect head num to {aspect_head_num}.')
                     self.aspect_head_num = aspect_gap_args['head_num']
             else:
-                print('set aspect head num to {aspect_head_num}.')
                 self.aspect_head_num = aspect_gap_args['head_num']
 
             self.aspect_gap_loss_amplification = aspect_gap_args['amplification']
@@ -315,9 +346,8 @@ class MTCGModel(nn.Module):
                     raise Exception('Expect adversarial inputs for contrasitive loss.')
                 adv_encoder_output = self.encoder(input_ids=adv_input_ids, attention_mask=adv_attention_mask,
                                                   token_type_ids=adv_token_type_ids, return_dict=True).pooler_output
-                adv_latent = self.trans1(adv_encoder_output)
+                adv_latent = self.connector_encoder(adv_encoder_output)
                 adv_loss = self.contrasitive_loss(latent, adv_latent)
-                # TO DO: change arg `dim' in the future
                 loss += adv_loss * self.losslist['contrasitive_loss']
                 w -= self.losslist['contrasitive_loss']
                 loss_detail["contrasitive_loss"] = adv_loss.detach()
@@ -420,7 +450,7 @@ class MTCGModel(nn.Module):
             eps = torch.zeros_like(input_latent).normal_(std=variation).to(input_latent.device)
             input_latent = input_latent + eps
 
-        past_key_values = self.trans2(input_latent)
+        past_key_values = self.connector_decoder(input_latent)
 
         if input_ids is None:
             input_ids = self.decoder.generate(input_ids=torch.LongTensor([[50256]] * batch_size).to(device),
@@ -466,9 +496,9 @@ class MTCGModel(nn.Module):
                     topp=0.9,
                     lp=1.0,
                     use_cache=True):
-        '''
+        """
         重建生成文本
-        '''
+        """
         device = next(self.parameters()).device
         batch_size = encoder_input_ids.shape[0]
         encoder_input_ids = encoder_input_ids.to(device)
